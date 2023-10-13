@@ -92,6 +92,5 @@ def main():
         pass  # GPIOZero automatically handles cleanup
 
 
-
 if __name__ == '__main__':
     main()

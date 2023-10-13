@@ -1,12 +1,13 @@
 import time
 import sqlite3
+import unittest
+from unittest.mock import patch
 
 # Define GPIO pins
-RELAY_PIN = 17  # Pin where the relay is connected
-RFID_PIN = 27  # Pin where the RFID reader is connected
-
-USE_MOCK = True  # Set to False when running on actual Raspberry Pi with hardware
-
+RELAY_PIN = 17
+RFID_PIN = 27
+USE_MOCK = True
+CURRENT_MODULE = __name__
 
 # Mocked version of GPiOZero classes for testing
 class MockOutputDevice:
@@ -19,101 +20,142 @@ class MockOutputDevice:
     def off(self):
         print(f"Mocked relay (pin {self.pin}) turned OFF")
 
-
 class MockButton:
     def __init__(self, pin):
         self.pin = pin
 
     @property
     def is_pressed(self):
-        # Simulate a tag scan by pressing Enter
         input("Press Enter to simulate RFID scan...")
         return True
-
 
 if USE_MOCK:
     relay = MockOutputDevice(RELAY_PIN)
     rfid_reader = MockButton(RFID_PIN)
 else:
     from gpiozero import OutputDevice, Button
-
     relay = OutputDevice(RELAY_PIN)
     rfid_reader = Button(RFID_PIN)
 
-
 def unlock_door():
-    """Activate the relay to unlock the door for 3 seconds."""
     relay.on()
     time.sleep(3)
     relay.off()
 
-
 def initialize_database():
-    """Set up the SQLite database and create the tags table if it doesn't exist."""
     conn = sqlite3.connect('authorized_tags.db')
     cursor = conn.cursor()
-
-    # Create table if it doesn't exist
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS tags (
             id INTEGER PRIMARY KEY,
             tag_value TEXT NOT NULL UNIQUE
         )
     ''')
-
     conn.commit()
     conn.close()
 
+def add_tag(tag_value, conn=None):
+    if conn is None:
+        conn = sqlite3.connect('authorized_tags.db')
+        close_connection = True
+    else:
+        close_connection = False
 
-def add_tag(tag_value):
-    """Add a tag value to the database."""
-    conn = sqlite3.connect('authorized_tags.db')
     cursor = conn.cursor()
 
-    cursor.execute('INSERT INTO tags (tag_value) VALUES (?)', (tag_value,))
+    try:
+        cursor.execute('INSERT INTO tags (tag_value) VALUES (?)', (tag_value,))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # Tag already exists; we can choose to pass, raise a custom exception, or log it.
+        pass
 
-    conn.commit()
-    conn.close()
+    if close_connection:
+        conn.close()
+
 
 
 def remove_tag(tag_value):
-    """Remove a tag value from the database."""
+    initialize_database()
     conn = sqlite3.connect('authorized_tags.db')
     cursor = conn.cursor()
-
     cursor.execute('DELETE FROM tags WHERE tag_value = ?', (tag_value,))
-
     conn.commit()
     conn.close()
 
-
 def is_authorized(tag_value):
-    """Check if a given tag value is authorized (exists in the database)."""
+    initialize_database()
     conn = sqlite3.connect('authorized_tags.db')
     cursor = conn.cursor()
-
     cursor.execute('SELECT * FROM tags WHERE tag_value = ?', (tag_value,))
     result = cursor.fetchone()
-
     conn.close()
-
     return result is not None
 
+def mock_read_rfid():
+    return "1234567890ABCDEF"
 
 def main():
-    """Main loop that checks for RFID input and unlocks the door if authorized."""
     try:
         while True:
-            if rfid_reader.is_pressed:  # If RFID tag is detected
-                # TODO: Uncomment and implement the following lines when ready
-                # tag_id = read_rfid()  # Function to read the RFID tag ID
-                # if is_authorized(tag_id):  # Check the database
-                unlock_door()
-            time.sleep(0.1)  # Short pause to reduce CPU usage
+            if rfid_reader.is_pressed:
+                tag_id = mock_read_rfid()
+                if is_authorized(tag_id):
+                    unlock_door()
+            time.sleep(0.1)
     except KeyboardInterrupt:
-        pass  # GPIOZero automatically handles cleanup if using real library
+        pass
 
+class RFIDTest(unittest.TestCase):
+    def setUp(self):
+        self.conn = sqlite3.connect(':memory:')
+        self.cursor = self.conn.cursor()
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS tags (
+                id INTEGER PRIMARY KEY,
+                tag_value TEXT NOT NULL UNIQUE
+            )
+        ''')
+        self.conn.commit()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_add_tag(self):
+        add_tag("TEST_TAG", conn=self.conn)
+        self.cursor.execute('SELECT * FROM tags WHERE tag_value = ?', ("TEST_TAG",))
+        result = self.cursor.fetchone()
+        self.assertIsNotNone(result)
+
+    def test_remove_tag(self):
+        add_tag("TEST_TAG")
+        remove_tag("TEST_TAG")
+        self.cursor.execute('SELECT * FROM tags WHERE tag_value = ?', ("TEST_TAG",))
+        result = self.cursor.fetchone()
+        self.assertIsNone(result)
+
+    def test_is_authorized(self):
+        add_tag("TEST_TAG")
+        self.assertTrue(is_authorized("TEST_TAG"))
+        self.assertFalse(is_authorized("NON_EXISTENT_TAG"))
+
+    class CallCounter:
+        def __init__(self, limit):
+            self.count = 0
+            self.limit = limit
+
+        def __call__(self, *args, **kwargs):
+            if self.count >= self.limit:
+                raise KeyboardInterrupt
+            self.count += 1
+            return "1234567890ABCDEF"
+
+    @patch('builtins.input', return_value="")
+    @patch(f'{CURRENT_MODULE}.mock_read_rfid', return_value="1234567890ABCDEF")  # explicitly set return value here
+    def test_main_loop(self, mock_input, mock_read_rfid_function):
+        add_tag("1234567890ABCDEF")
+        main()
 
 
 if __name__ == '__main__':
-    main()
+    unittest.main()
